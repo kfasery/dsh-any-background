@@ -22,9 +22,15 @@ export const inject = ['connection', 'webServer']
 const DATA_DIR = '.dsh-any-background-data'
 const CONFIG_FILE = 'theme-config.json'
 const WALLPAPER_FILE = 'wallpaper.jpg'
+const RPC_ROUTE = '/dsh-any-background'
 const VIDEO_ROUTE = '/dsh-any-background/video'
 const UPLOAD_ROUTE = '/dsh-any-background/video/upload'
 const UPLOAD_TMP = 'wallpaper.upload.tmp'
+// Unary RPC body cap: a wallpaper or a data-URL video import travels through
+// this route, so it matches the shared `/api` carrier's default rather than
+// imposing a plugin-local limit.
+const RPC_BODY_MAX = 300 * 1024 * 1024
+const ENDPOINT_SEGMENT = /^[A-Za-z0-9_$.-]+$/
 // Network-URL wallpaper fetch: cap the download and time it out so a bad link
 // can't stall the UI or fill the drive.
 const WALLPAPER_FETCH_MAX = 25 * 1024 * 1024
@@ -463,43 +469,148 @@ async function handleVideoUpload(req: any, res: any): Promise<void> {
 
 const NS = 'dshAnyBackground'
 
-export function apply(ctx: any): void {
-  // Dedicated RPC channel (never the shared `/api`), so DSH slash commands
-  // stay intact.
-  const dispose = ctx.connection.rpc.handle(
-    '/dsh-any-background',
-    async (ep: string, payload: any) => {
-      const method = ep.slice(`${NS}/`.length)
-      try {
-        switch (method) {
-          case 'read':
-            // The video travels as a URL, never as bytes.
-            return { ok: true, value: { config: await readConfig(), wallpaper: await readWallpaper(), videoUrl: await videoUrl() } }
-          case 'writeConfig':
-            return { ok: true, value: await writeConfig((payload?.config ?? {}) as ThemeConfig) }
-          case 'setWallpaper':
-            return { ok: true, value: await writeWallpaper((payload?.dataUrl ?? null) as string | null) }
-          case 'setVideo':
-            return { ok: true, value: await writeVideo((payload?.dataUrl ?? null) as string | null) }
-          case 'setWallpaperUrl':
-            return { ok: true, value: await writeWallpaperFromUrl((payload?.url ?? null) as string | null) }
-          default:
-            return { ok: false, error: { code: 'dsh-any-background/bad-request', message: `unknown endpoint ${ep}`, details: { issues: [] } } }
-          }
-        } catch (e) {
-        return { ok: false, error: { code: 'dsh-any-background/internal', message: e instanceof Error ? e.message : String(e), details: {} } }
+/** Endpoint name carried by one RPC URL path, or undefined when it is not an
+ *  endpoint of this plugin's channel. */
+function endpointFromUrl(pathname: string): string | undefined {
+  if (!pathname.startsWith(`${RPC_ROUTE}/`)) return undefined
+  const endpoint = pathname.slice(RPC_ROUTE.length + 1)
+  const segments = endpoint.split('/')
+  if (segments.some(segment =>
+    segment === '' || segment === '.' || segment === '..' || !ENDPOINT_SEGMENT.test(segment))) {
+    return undefined
+  }
+  return endpoint
+}
+
+/** Method name of one endpoint, e.g. `dshAnyBackground/read` → `read`. */
+function endpointMethod(endpoint: string): string {
+  return endpoint.startsWith(`${NS}/`) ? endpoint.slice(NS.length + 1) : ''
+}
+
+/** Read a request body as UTF-8 text, bounded by `limit`; null once the limit
+ *  is exceeded (the caller answers 413) or the stream fails. */
+function readBody(req: any, limit: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    const declared = Number(req.headers['content-length'])
+    if (Number.isFinite(declared) && declared > limit) {
+      req.resume()
+      resolve(null)
+      return
+    }
+    const chunks: Buffer[] = []
+    let size = 0
+    let overflow = false
+    req.on('data', (chunk: Buffer) => {
+      if (overflow) return
+      size += chunk.length
+      if (size > limit) {
+        overflow = true
+        chunks.length = 0
+        return
       }
-    },
-    { authority: 'trusted-host' },
-  )
-  // Longest prefix wins over the RPC channel's shorter one; exact beats
-  // prefix, so uploads land in the upload handler even though UPLOAD_ROUTE
-  // sits inside VIDEO_ROUTE. Disposing the plugin removes both routes.
-  const disposeRoute = ctx.webServer.register({ kind: 'prefix', path: VIDEO_ROUTE, handler: serveVideo })
-  const disposeUpload = ctx.webServer.register({ kind: 'exact', path: UPLOAD_ROUTE, handler: handleVideoUpload })
-  ctx.on('dispose', () => {
-    disposeRoute()
-    disposeUpload()
-    void dispose()
+      chunks.push(chunk)
+    })
+    req.on('end', () => { resolve(overflow ? null : Buffer.concat(chunks).toString('utf8')) })
+    req.on('error', () => { resolve(null) })
   })
+}
+
+/** Write one unary RPC answer in the Connection `server-response` envelope the
+ *  browser's Connection client decodes. */
+function sendRpcResult(res: any, rpcId: unknown, result: unknown): void {
+  res.writeHead(200, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify({
+    type: 'server-response',
+    rpcId: typeof rpcId === 'string' ? rpcId : 'invalid-request',
+    result,
+  }))
+}
+
+export function apply(ctx: any): void {
+  const dispatch = async (ep: string, payload: any) => {
+    const method = endpointMethod(ep)
+    try {
+      switch (method) {
+        case 'read':
+          // The video travels as a URL, never as bytes.
+          return { ok: true, value: { config: await readConfig(), wallpaper: await readWallpaper(), videoUrl: await videoUrl() } }
+        case 'writeConfig':
+          return { ok: true, value: await writeConfig((payload?.config ?? {}) as ThemeConfig) }
+        case 'setWallpaper':
+          return { ok: true, value: await writeWallpaper((payload?.dataUrl ?? null) as string | null) }
+        case 'setVideo':
+          return { ok: true, value: await writeVideo((payload?.dataUrl ?? null) as string | null) }
+        case 'setWallpaperUrl':
+          return { ok: true, value: await writeWallpaperFromUrl((payload?.url ?? null) as string | null) }
+        default:
+          return { ok: false, error: { code: 'dsh-any-background/bad-request', message: `unknown endpoint ${ep}`, details: { issues: [] } } }
+      }
+    } catch (e) {
+      return { ok: false, error: { code: 'dsh-any-background/internal', message: e instanceof Error ? e.message : String(e), details: {} } }
+    }
+  }
+  // This plugin owns its dedicated RPC channel route instead of asking
+  // `ctx.connection.rpc.handle` for it: Connection resolves a channel's Web
+  // route through the service's own context, and in a composed profile that
+  // context has no `webServer` in scope, so `handle()` fails the boot with
+  // `cannot get property "webServer" without inject`. The route below speaks
+  // the same unary envelope the browser's Connection client already sends
+  // (`client-request` in, `server-response` out, never the shared `/api`, so
+  // DSH slash commands stay intact) and applies Connection's own Host/Origin
+  // plus browser-session fence.
+  const handleRpc = async (req: any, res: any): Promise<void> => {
+    try {
+      const rejection = ctx.connection.requestRejection(req)
+      if (rejection !== undefined) {
+        res.writeHead(rejection)
+        res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
+        return
+      }
+      const endpoint = req.method === 'POST'
+        ? endpointFromUrl(new URL(req.url ?? '/', 'http://dsh.internal').pathname)
+        : undefined
+      if (endpoint === undefined) {
+        res.writeHead(404)
+        res.end('not found')
+        return
+      }
+      const contentType = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : ''
+      if (contentType.split(';')[0]!.trim().toLowerCase() !== 'application/json') {
+        res.writeHead(415)
+        res.end('content type must be application/json')
+        return
+      }
+      let message: any
+      const text = await readBody(req, RPC_BODY_MAX)
+      if (text === null) {
+        res.writeHead(413)
+        res.end()
+        return
+      }
+      try {
+        message = JSON.parse(text)
+      } catch {
+        res.writeHead(400)
+        res.end('body is not JSON')
+        return
+      }
+      if (message?.type !== 'client-request' || typeof message.rpcId !== 'string' || message.method !== endpoint) {
+        sendRpcResult(res, message?.rpcId, {
+          ok: false,
+          error: { code: 'dsh-any-background/bad-request', message: 'invalid client-request message', details: {} },
+        })
+        return
+      }
+      sendRpcResult(res, message.rpcId, await dispatch(endpoint, message.payload))
+    } catch (e) {
+      console.error('dsh-any-background: failed to serve the theme RPC request', e)
+      try { res.writeHead(500); res.end() } catch { /* response already sent */ }
+    }
+  }
+  // Longest prefix wins over the RPC route's shorter one; exact beats prefix,
+  // so uploads land in the upload handler even though UPLOAD_ROUTE sits inside
+  // VIDEO_ROUTE. Each route is an effect, so unloading the plugin removes it.
+  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: RPC_ROUTE, handler: handleRpc }), 'dsh-any-background: RPC route')
+  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: VIDEO_ROUTE, handler: serveVideo }), 'dsh-any-background: video route')
+  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: UPLOAD_ROUTE, handler: handleVideoUpload }), 'dsh-any-background: video upload route')
 }
